@@ -1,38 +1,101 @@
+
 name: Build IPA from your own Spotify IPA
 
 on:
+  workflow_run:
+    workflows: ["Atualizar Vitrine automaticamente"]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       ipa_url:
-        description: "Direct link to a decrypted Spotify IPA"
-        required: true
+        description: "Direct link to an authorized IPA"
+        required: false
         type: string
       upload_method:
         description: "Where to put the result"
         default: artifacts
         type: choice
-        options: [artifacts, filebin, both]
+        options:
+          - artifacts
+          - filebin
+          - both
+
+permissions:
+  contents: read
+  actions: read
 
 env:
   THEOS: ${{ github.workspace }}/theos
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.decision.outputs.should_build }}
+      target_sha: ${{ steps.decision.outputs.target_sha }}
+    steps:
+      - name: Determine whether a build is needed
+        id: decision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "target_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$RUN_CONCLUSION" != "success" ]; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CURRENT_SHA="$(gh api "repos/$REPO/commits/main" --jq '.sha')"
+
+          LAST_BUILT_SHA="$(
+            gh api "repos/$REPO/actions/workflows/build-ipa.yml/runs?event=workflow_run&status=success&per_page=30" \
+              --jq '[.workflow_runs[] | select(.head_sha != null)] | first | .head_sha // ""'
+          )"
+
+          if [ -n "$LAST_BUILT_SHA" ] && [ "$CURRENT_SHA" = "$LAST_BUILT_SHA" ]; then
+            echo "No new repository commit detected."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "target_sha=$CURRENT_SHA" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v5
+      - name: Checkout Vitrine
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check.outputs.target_sha }}
+          persist-credentials: false
 
-      - uses: levibostian/action-hide-sensitive-inputs@v1
-
-      - uses: maxim-lobanov/setup-xcode@v1
+      - name: Configure Xcode
+        uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: latest-stable
 
-      - uses: actions/checkout@v5
+      - name: Checkout Theos
+        uses: actions/checkout@v4
         with:
           repository: theos/theos
           path: theos
           submodules: recursive
+          persist-credentials: false
 
       - name: Install tools
         run: |
@@ -40,27 +103,59 @@ jobs:
           python3 -m pip install --break-system-packages git+https://github.com/asdfzxcvbn/pyzule-rw.git
 
       - name: Download IPA
+        env:
+          IPA_URL: ${{ inputs.ipa_url || vars.SPOTIFY_IPA_URL }}
         run: |
+          set -euo pipefail
+
+          if [ -z "$IPA_URL" ]; then
+            echo "::error::Configure SPOTIFY_IPA_URL."
+            exit 1
+          fi
+
           mkdir -p ipa
-          curl -fsSL "${{ inputs.ipa_url || vars.SPOTIFY_IPA_URL }}" -o ipa/spotify.ipa
-          case "$(file --mime-type -b ipa/spotify.ipa)" in application/zip|application/x-ios-app) ;; *) echo "::error::Not an IPA"; exit 1 ;; esac
+          curl --fail --location --silent --show-error \
+            --retry 3 \
+            "$IPA_URL" \
+            -o ipa/spotify.ipa
 
-      - run: make release
+          case "$(file --mime-type -b ipa/spotify.ipa)" in
+            application/zip|application/x-ios-app)
+              echo "IPA downloaded."
+              ;;
+            *)
+              echo "::error::Downloaded file is not an IPA."
+              exit 1
+              ;;
+          esac
 
-      - uses: actions/upload-artifact@v5
-        if: inputs.upload_method != 'filebin'
+      - name: Build IPA
+        run: make release
+
+      - name: Upload GitHub artifact
+        if: ${{ inputs.upload_method != 'filebin' }}
+        uses: actions/upload-artifact@v4
         with:
-          name: vitrine.ipa
+          name: vitrine-ipa
           path: out/*.ipa
           if-no-files-found: error
+          retention-days: 14
 
       - name: Upload to filebin.net
-        if: inputs.upload_method != 'artifacts'
+        if: ${{ inputs.upload_method == 'filebin' || inputs.upload_method == 'both' }}
         run: |
+          set -euo pipefail
           BIN="vitrine-${{ github.run_id }}"
+
           echo "### filebin.net download" >> "$GITHUB_STEP_SUMMARY"
+
           for f in out/*.ipa; do
-            curl -fsS -X POST -H "Content-Type: application/octet-stream" --data-binary "@$f" "https://filebin.net/$BIN/$(basename "$f")" >/dev/null
+            curl -fsS -X POST \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@$f" \
+              "https://filebin.net/$BIN/$(basename "$f")" >/dev/null
+
             echo "- https://filebin.net/$BIN/$(basename "$f")" >> "$GITHUB_STEP_SUMMARY"
           done
-          echo "- _filebin deletes bins after a few days of inactivity, download promptly._" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Download promptly; filebin storage is temporary." >> "$GITHUB_STEP_SUMMARY"
