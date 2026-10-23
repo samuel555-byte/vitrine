@@ -76,7 +76,7 @@ jobs:
   build:
     needs: check
     if: needs.check.outputs.should_build == 'true'
-    runs-on: macos-latest
+    runs-on: macos-15-intel
     steps:
       - name: Checkout Vitrine
         uses: actions/checkout@v4
